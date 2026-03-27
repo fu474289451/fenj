@@ -99,10 +99,12 @@ def download_video(url: str, temp_dir: str, progress_cb) -> tuple:
         elif d["status"] == "finished":
             progress_cb("下载完成，正在处理...", 100)
 
+    # Prefer single-file formats that don't require ffmpeg to merge.
+    # "best" picks the best single stream; the explicit fallbacks
+    # try mp4 first for OpenCV compatibility.
     ydl_opts = {
         "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
+        "format": "best[ext=mp4]/best",
         "progress_hooks": [ydl_hook],
         "noplaylist": True,
         "quiet": True,
