@@ -10,12 +10,14 @@ import tempfile
 import threading
 import platform
 import subprocess
+import math
 from pathlib import Path
-from collections import namedtuple
+from collections import namedtuple, Counter
 
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+import numpy as np
 import yt_dlp
 import cv2
 from scenedetect import open_video, SceneManager
@@ -34,6 +36,22 @@ STORYBOARD_FILENAME = "storyboard.html"
 COLS_PER_ROW = 3
 
 SceneCut = namedtuple("SceneCut", ["index", "start_time", "end_time", "start_frame", "end_frame"])
+
+# Load face cascade once (ships with OpenCV)
+_face_cascade_path = os.path.join(
+    os.path.dirname(cv2.__file__), "data", "haarcascade_frontalface_default.xml"
+)
+_face_cascade = None
+
+
+def _get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None:
+        if os.path.exists(_face_cascade_path):
+            _face_cascade = cv2.CascadeClassifier(_face_cascade_path)
+        else:
+            _face_cascade = cv2.CascadeClassifier()
+    return _face_cascade
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +104,238 @@ def open_folder(path: str):
 
 
 # ---------------------------------------------------------------------------
+# Shot analysis functions
+# ---------------------------------------------------------------------------
+
+def analyze_shot_type(frame) -> tuple:
+    """Analyze shot type and detect faces. Returns (shot_type_str, num_faces)."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = frame.shape[:2]
+    frame_area = h * w
+
+    cascade = _get_face_cascade()
+    faces = []
+    if not cascade.empty():
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        if isinstance(faces, np.ndarray) and len(faces) > 0:
+            faces = faces.tolist()
+        elif not isinstance(faces, list):
+            faces = []
+
+    num_faces = len(faces)
+
+    if num_faces > 0:
+        max_face_area = max(fw * fh for (_, _, fw, fh) in faces)
+        ratio = max_face_area / frame_area
+        if ratio > 0.15:
+            return "特写", num_faces
+        elif ratio > 0.05:
+            return "近景", num_faces
+        elif ratio > 0.01:
+            return "中景", num_faces
+        else:
+            return "全景", num_faces
+    else:
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.count_nonzero(edges) / frame_area
+        if edge_density > 0.15:
+            return "近景", 0
+        elif edge_density > 0.06:
+            return "中景", 0
+        else:
+            return "远景", 0
+
+
+def analyze_camera_movement(cap, start_frame: int, end_frame: int, fps: float) -> str:
+    """Analyze camera movement using optical flow between sampled frame pairs."""
+    scene_frames = end_frame - start_frame
+    if scene_frames < 2:
+        return "固定"
+
+    # Sample ~6 frame pairs across the scene
+    num_pairs = min(6, scene_frames // max(1, int(fps * 0.2)))
+    if num_pairs < 1:
+        num_pairs = 1
+    step = max(1, scene_frames // (num_pairs + 1))
+    gap = max(1, int(fps * 0.15))
+
+    dx_list = []
+    dy_list = []
+    divergence_list = []
+
+    for p in range(num_pairs):
+        f1_idx = start_frame + step * (p + 1)
+        f2_idx = f1_idx + gap
+        if f2_idx >= end_frame:
+            break
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f1_idx)
+        ret1, frame1 = cap.read()
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f2_idx)
+        ret2, frame2 = cap.read()
+        if not ret1 or not ret2 or frame1 is None or frame2 is None:
+            continue
+
+        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+
+        # Downscale for speed
+        small_h, small_w = 120, 160
+        gray1_s = cv2.resize(gray1, (small_w, small_h))
+        gray2_s = cv2.resize(gray2, (small_w, small_h))
+
+        flow = cv2.calcOpticalFlowFarneback(
+            gray1_s, gray2_s, None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+        )
+
+        dx_mean = np.mean(flow[:, :, 0])
+        dy_mean = np.mean(flow[:, :, 1])
+        dx_list.append(dx_mean)
+        dy_list.append(dy_mean)
+
+        # Compute divergence for zoom detection
+        cy, cx = small_h // 2, small_w // 2
+        flow_center = flow[cy - 20:cy + 20, cx - 20:cx + 20]
+        flow_edge_top = flow[:20, :, :]
+        flow_edge_bot = flow[-20:, :, :]
+        flow_edge_left = flow[:, :20, :]
+        flow_edge_right = flow[:, -20:, :]
+
+        # Radial magnitude: positive = expanding (zoom out/pull), negative = contracting (zoom in/push)
+        edge_mag = (
+            np.mean(np.sqrt(flow_edge_top[:, :, 0]**2 + flow_edge_top[:, :, 1]**2)) +
+            np.mean(np.sqrt(flow_edge_bot[:, :, 0]**2 + flow_edge_bot[:, :, 1]**2)) +
+            np.mean(np.sqrt(flow_edge_left[:, :, 0]**2 + flow_edge_left[:, :, 1]**2)) +
+            np.mean(np.sqrt(flow_edge_right[:, :, 0]**2 + flow_edge_right[:, :, 1]**2))
+        ) / 4.0
+        center_mag = np.mean(np.sqrt(flow_center[:, :, 0]**2 + flow_center[:, :, 1]**2))
+        divergence_list.append(edge_mag - center_mag)
+
+    if not dx_list:
+        return "固定"
+
+    avg_dx = np.mean(dx_list)
+    avg_dy = np.mean(dy_list)
+    avg_div = np.mean(divergence_list)
+    magnitude = math.sqrt(avg_dx**2 + avg_dy**2)
+
+    # Thresholds
+    if magnitude < 0.8 and abs(avg_div) < 0.5:
+        return "固定"
+
+    # Check zoom (push/pull) first
+    if abs(avg_div) > 1.0 and abs(avg_div) > magnitude * 0.6:
+        if avg_div > 0:
+            return "拉"
+        else:
+            return "推"
+
+    # Determine pan/tilt
+    if abs(avg_dx) > abs(avg_dy) * 1.3:
+        return "右摇" if avg_dx > 0 else "左摇"
+    elif abs(avg_dy) > abs(avg_dx) * 1.3:
+        return "下摇" if avg_dy > 0 else "上摇"
+    else:
+        return "跟移"
+
+
+def describe_scene(frame, num_faces: int, shot_type: str, movement: str) -> str:
+    """Generate a brief textual description of the scene."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    brightness = np.mean(hsv[:, :, 2])
+
+    b_mean = np.mean(frame[:, :, 0].astype(float))
+    r_mean = np.mean(frame[:, :, 2].astype(float))
+
+    parts = []
+
+    # Brightness
+    if brightness > 170:
+        parts.append("明亮")
+    elif brightness > 85:
+        parts.append("中等亮度")
+    else:
+        parts.append("暗调")
+
+    # Color temperature
+    diff = r_mean - b_mean
+    if diff > 15:
+        parts.append("暖色调")
+    elif diff < -15:
+        parts.append("冷色调")
+
+    # People
+    if num_faces == 0:
+        parts.append("无人物")
+    elif num_faces == 1:
+        parts.append("1人入画")
+    else:
+        parts.append(f"{num_faces}人入画")
+
+    # Shot type + movement context
+    parts.append(f"{shot_type}景别")
+    if movement != "固定":
+        parts.append(f"镜头{movement}")
+    else:
+        parts.append("固定镜头")
+
+    return "，".join(parts)
+
+
+def generate_director_summary(scenes: list, analyses: list, title: str) -> str:
+    """Generate a director's summary based on scene statistics."""
+    total_shots = len(scenes)
+    if total_shots == 0:
+        return "无镜头数据。"
+
+    total_duration = scenes[-1].end_time - scenes[0].start_time
+    durations = [s.end_time - s.start_time for s in scenes]
+    avg_dur = sum(durations) / len(durations)
+    min_dur = min(durations)
+    max_dur = max(durations)
+
+    # Pace
+    if avg_dur < 2.0:
+        pace = "快节奏"
+    elif avg_dur < 5.0:
+        pace = "中等节奏"
+    else:
+        pace = "慢节奏"
+
+    # Shot type distribution
+    shot_types = [a.get("shot_type", "未知") for a in analyses]
+    st_counter = Counter(shot_types)
+    st_parts = []
+    for st, cnt in st_counter.most_common():
+        pct = cnt / total_shots * 100
+        st_parts.append(f"{st} {pct:.0f}%")
+
+    # Movement distribution
+    movements = [a.get("movement", "未知") for a in analyses]
+    mv_counter = Counter(movements)
+    mv_parts = []
+    for mv, cnt in mv_counter.most_common():
+        pct = cnt / total_shots * 100
+        mv_parts.append(f"{mv} {pct:.0f}%")
+
+    # Format duration
+    dur_min = int(total_duration // 60)
+    dur_sec = int(total_duration % 60)
+    dur_str = f"{dur_min}分{dur_sec}秒" if dur_min > 0 else f"{dur_sec}秒"
+
+    lines = [
+        f"影片《{title}》共 {total_shots} 个镜头，总时长 {dur_str}。",
+        f"平均镜头时长 {avg_dur:.1f}秒，整体呈{pace}剪辑风格"
+        f"（最短 {min_dur:.1f}秒，最长 {max_dur:.1f}秒）。",
+        f"景别分布：{' / '.join(st_parts)}。",
+        f"运镜方式：{' / '.join(mv_parts)}。",
+    ]
+    return " ".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline functions
 # ---------------------------------------------------------------------------
 
@@ -100,8 +350,6 @@ def download_video(url: str, temp_dir: str, progress_cb) -> tuple:
             progress_cb("下载完成，正在处理...", 100)
 
     # Prefer single-file formats that don't require ffmpeg to merge.
-    # "best" picks the best single stream; the explicit fallbacks
-    # try mp4 first for OpenCV compatibility.
     ydl_opts = {
         "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
         "format": "best[ext=mp4]/best",
@@ -175,9 +423,9 @@ def detect_scenes(video_path: str, threshold: float, progress_cb) -> list:
     return scenes
 
 
-def capture_scene_gifs(video_path: str, scenes: list, output_dir: str,
-                       progress_cb) -> list:
-    """For each scene, sample frames evenly and save as animated GIF."""
+def capture_gifs_and_analyze(video_path: str, scenes: list, output_dir: str,
+                             progress_cb) -> tuple:
+    """Generate GIFs and analyze each scene. Returns (gif_paths, analyses)."""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
@@ -187,6 +435,7 @@ def capture_scene_gifs(video_path: str, scenes: list, output_dir: str,
     os.makedirs(shots_dir, exist_ok=True)
 
     paths = []
+    analyses = []
     total = len(scenes)
 
     for i, scene in enumerate(scenes):
@@ -194,9 +443,7 @@ def capture_scene_gifs(video_path: str, scenes: list, output_dir: str,
         if scene_frames <= 0:
             scene_frames = 1
 
-        # Determine how many frames to sample (up to GIF_MAX_FRAMES)
         num_samples = min(GIF_MAX_FRAMES, max(1, scene_frames))
-        # Calculate step to sample evenly across the scene
         if num_samples == 1:
             sample_indices = [scene.start_frame]
         else:
@@ -204,15 +451,20 @@ def capture_scene_gifs(video_path: str, scenes: list, output_dir: str,
             sample_indices = [int(scene.start_frame + step * j) for j in range(num_samples)]
 
         pil_frames = []
-        for frame_idx in sample_indices:
+        representative_frame = None  # BGR frame for analysis
+
+        for idx_j, frame_idx in enumerate(sample_indices):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret or frame is None:
                 continue
-            # Convert BGR -> RGB
+
+            # Keep a representative frame (~ 1/3 into the scene) for shot type analysis
+            if idx_j == len(sample_indices) // 3:
+                representative_frame = frame.copy()
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = PILImage.fromarray(rgb)
-            # Resize to GIF_WIDTH, keep aspect ratio
             orig_w, orig_h = pil_img.size
             if orig_w > 0:
                 scale = GIF_WIDTH / orig_w
@@ -220,11 +472,19 @@ def capture_scene_gifs(video_path: str, scenes: list, output_dir: str,
                 pil_img = pil_img.resize((GIF_WIDTH, new_h), PILImage.LANCZOS)
             pil_frames.append(pil_img)
 
+        # Fallback representative frame
+        if representative_frame is None and pil_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, sample_indices[0])
+            ret, representative_frame = cap.read()
+            if not ret:
+                representative_frame = None
+
+        # Save GIF
         filename = f"shot_{i + 1:03d}.gif"
         filepath = os.path.join(shots_dir, filename)
 
         if pil_frames:
-            frame_duration = 1000 // GIF_FPS  # ms per frame
+            frame_duration = 1000 // GIF_FPS
             if len(pil_frames) == 1:
                 pil_frames[0].save(filepath, format="GIF")
             else:
@@ -237,17 +497,53 @@ def capture_scene_gifs(video_path: str, scenes: list, output_dir: str,
         else:
             paths.append(None)
 
+        # Analyze shot type
+        shot_type = "中景"
+        num_faces = 0
+        if representative_frame is not None:
+            try:
+                shot_type, num_faces = analyze_shot_type(representative_frame)
+            except Exception:
+                pass
+
+        # Analyze camera movement
+        movement = "固定"
+        try:
+            movement = analyze_camera_movement(cap, scene.start_frame, scene.end_frame, fps)
+        except Exception:
+            pass
+
+        # Generate description
+        description = ""
+        if representative_frame is not None:
+            try:
+                description = describe_scene(representative_frame, num_faces, shot_type, movement)
+            except Exception:
+                description = f"{shot_type}，镜头{movement}"
+
+        analyses.append({
+            "shot_type": shot_type,
+            "movement": movement,
+            "description": description,
+            "num_faces": num_faces,
+        })
+
         pct = ((i + 1) / total) * 100
-        progress_cb(f"正在生成 GIF {i + 1}/{total}...", pct)
+        progress_cb(f"正在生成 GIF 并分析 {i + 1}/{total}...", pct)
 
     cap.release()
-    return paths
+    return paths, analyses
 
 
-def create_storyboard_html(scenes: list, gif_paths: list,
+def create_storyboard_html(scenes: list, gif_paths: list, analyses: list,
+                           title: str, director_summary: str,
                            output_path: str, progress_cb):
-    """Generate an HTML storyboard with 3-column grid layout."""
+    """Generate an HTML storyboard with title, director summary, and 3-column grid."""
     progress_cb("正在生成分镜表...", 0)
+
+    # Escape HTML
+    def esc(text):
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
     cards_html = []
     total = len(scenes)
@@ -258,6 +554,11 @@ def create_storyboard_html(scenes: list, gif_paths: list,
         gif_rel = ""
         if i < len(gif_paths) and gif_paths[i] and os.path.exists(gif_paths[i]):
             gif_rel = f"{SHOT_DIR_NAME}/shot_{i + 1:03d}.gif"
+
+        analysis = analyses[i] if i < len(analyses) else {}
+        shot_type = esc(analysis.get("shot_type", ""))
+        movement = esc(analysis.get("movement", ""))
+        description = esc(analysis.get("description", ""))
 
         if gif_rel:
             img_tag = f'<img src="{gif_rel}" alt="Shot {i+1}">'
@@ -272,9 +573,10 @@ def create_storyboard_html(scenes: list, gif_paths: list,
           <span class="timecode">{timecode}</span>
           <span class="duration">{duration:.1f}s</span>
         </div>
+        <div class="row-desc">{description}</div>
         <div class="row-fields">
-          <span>景别：________</span>
-          <span>运镜：________</span>
+          <span class="field">景别：<b>{shot_type}</b></span>
+          <span class="field">运镜：<b>{movement}</b></span>
         </div>
         <div class="row-note">备注：</div>
       </div>
@@ -285,13 +587,15 @@ def create_storyboard_html(scenes: list, gif_paths: list,
         progress_cb(f"正在生成分镜表 {i + 1}/{total}...", pct)
 
     all_cards = "\n".join(cards_html)
+    title_esc = esc(title)
+    summary_esc = esc(director_summary)
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>分镜表 Storyboard</title>
+<title>{title_esc} - 分镜表</title>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
@@ -300,11 +604,30 @@ def create_storyboard_html(scenes: list, gif_paths: list,
     padding: 24px;
     color: #333;
   }}
-  h1 {{
+  .header {{
+    max-width: 1200px;
+    margin: 0 auto 20px auto;
     text-align: center;
-    margin-bottom: 24px;
-    font-size: 22px;
+  }}
+  h1 {{
+    font-size: 24px;
     color: #222;
+    margin-bottom: 16px;
+  }}
+  .director-summary {{
+    background: #e8f0fe;
+    border: 1px solid #c5d7f2;
+    border-radius: 8px;
+    padding: 14px 20px;
+    text-align: left;
+    font-size: 14px;
+    line-height: 1.8;
+    color: #333;
+  }}
+  .director-summary .label {{
+    font-weight: bold;
+    color: #1a56db;
+    margin-right: 6px;
   }}
   .grid {{
     display: grid;
@@ -337,7 +660,7 @@ def create_storyboard_html(scenes: list, gif_paths: list,
   }}
   .info {{
     padding: 8px 10px;
-    font-size: 13px;
+    font-size: 12px;
     border-top: 1px solid #e0e0e0;
   }}
   .row-main {{
@@ -346,6 +669,7 @@ def create_storyboard_html(scenes: list, gif_paths: list,
     align-items: center;
     margin-bottom: 4px;
     font-weight: bold;
+    font-size: 13px;
   }}
   .shot-num {{
     color: #1a73e8;
@@ -358,25 +682,43 @@ def create_storyboard_html(scenes: list, gif_paths: list,
   .duration {{
     color: #888;
   }}
+  .row-desc {{
+    color: #444;
+    margin-bottom: 4px;
+    line-height: 1.4;
+    font-size: 12px;
+  }}
   .row-fields {{
     display: flex;
-    gap: 16px;
+    gap: 12px;
     margin-bottom: 4px;
-    color: #666;
+    color: #555;
+  }}
+  .field b {{
+    color: #1a56db;
   }}
   .row-note {{
-    color: #666;
-    min-height: 20px;
+    color: #999;
+    min-height: 18px;
+    border-top: 1px dashed #e0e0e0;
+    padding-top: 3px;
+    margin-top: 2px;
   }}
   @media print {{
     body {{ padding: 8px; background: #fff; }}
     .grid {{ gap: 8px; }}
     .card {{ break-inside: avoid; border-width: 1px; }}
+    .director-summary {{ background: #f0f4fa; }}
   }}
 </style>
 </head>
 <body>
-<h1>分镜表 Storyboard</h1>
+<div class="header">
+  <h1>{title_esc}</h1>
+  <div class="director-summary">
+    <span class="label">导演阐述：</span>{summary_esc}
+  </div>
+</div>
 <div class="grid">
 {all_cards}
 </div>
@@ -397,24 +739,30 @@ def run_pipeline(url: str, threshold: float, progress_cb, done_cb, error_cb):
     temp_dir = tempfile.mkdtemp(prefix="scene_storyboard_")
 
     try:
-        # Phase 1: Download (0% - 40%)
-        dl_cb = make_phase_cb(progress_cb, 0, 40)
+        # Phase 1: Download (0% - 35%)
+        dl_cb = make_phase_cb(progress_cb, 0, 35)
         dl_cb("准备下载...", 0)
         video_path, title = download_video(url, temp_dir, dl_cb)
 
-        # Phase 2: Scene detection (40% - 65%)
-        detect_cb = make_phase_cb(progress_cb, 40, 65)
+        # Phase 2: Scene detection (35% - 55%)
+        detect_cb = make_phase_cb(progress_cb, 35, 55)
         scenes = detect_scenes(video_path, threshold, detect_cb)
 
-        # Phase 3: Generate GIFs (65% - 90%)
+        # Phase 3: Generate GIFs + analyze (55% - 90%)
         output_dir = get_output_dir(title)
-        gif_cb = make_phase_cb(progress_cb, 65, 90)
-        gif_paths = capture_scene_gifs(video_path, scenes, str(output_dir), gif_cb)
+        gif_cb = make_phase_cb(progress_cb, 55, 90)
+        gif_paths, analyses = capture_gifs_and_analyze(
+            video_path, scenes, str(output_dir), gif_cb
+        )
 
         # Phase 4: Generate HTML storyboard (90% - 100%)
         html_cb = make_phase_cb(progress_cb, 90, 100)
+        director_summary = generate_director_summary(scenes, analyses, title)
         html_path = str(output_dir / STORYBOARD_FILENAME)
-        create_storyboard_html(scenes, gif_paths, html_path, html_cb)
+        create_storyboard_html(
+            scenes, gif_paths, analyses, title, director_summary,
+            html_path, html_cb
+        )
 
         progress_cb("完成！", 100)
         done_cb(str(output_dir))
