@@ -16,7 +16,7 @@ from pathlib import Path
 from collections import namedtuple, Counter
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 import yt_dlp
@@ -757,14 +757,32 @@ def create_storyboard_html(scenes: list, gif_paths: list, analyses: list,
 # Pipeline orchestrator
 # ---------------------------------------------------------------------------
 
+def _is_local_file(path: str) -> bool:
+    """Check if the input is a local video file path."""
+    # Strip quotes that users might paste
+    p = path.strip().strip('"').strip("'")
+    if os.path.isfile(p):
+        ext = os.path.splitext(p)[1].lower()
+        return ext in ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts')
+    return False
+
+
 def run_pipeline(url: str, threshold: float, progress_cb, done_cb, error_cb):
     temp_dir = tempfile.mkdtemp(prefix="scene_storyboard_")
 
     try:
-        # Phase 1: Download (0% - 35%)
-        dl_cb = make_phase_cb(progress_cb, 0, 35)
-        dl_cb("准备下载...", 0)
-        video_path, title = download_video(url, temp_dir, dl_cb)
+        input_path = url.strip().strip('"').strip("'")
+
+        if _is_local_file(input_path):
+            # Local file — skip download
+            video_path = os.path.abspath(input_path)
+            title = os.path.splitext(os.path.basename(video_path))[0]
+            progress_cb("已识别本地文件，跳过下载", 35)
+        else:
+            # Online URL — download
+            dl_cb = make_phase_cb(progress_cb, 0, 35)
+            dl_cb("准备下载...", 0)
+            video_path, title = download_video(url, temp_dir, dl_cb)
 
         # Phase 2: Scene detection (35% - 55%)
         detect_cb = make_phase_cb(progress_cb, 35, 55)
@@ -806,7 +824,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("视频镜头分镜工具")
-        self.root.geometry("560x300")
+        self.root.geometry("580x320")
         self.root.resizable(False, False)
         self._running = False
         self._build_widgets()
@@ -814,39 +832,56 @@ class App:
     def _build_widgets(self):
         pad = {"padx": 12, "pady": 4}
 
-        tk.Label(self.root, text="视频链接：").grid(row=0, column=0, sticky="w", **pad)
-        self.url_entry = tk.Entry(self.root, width=52)
-        self.url_entry.grid(row=0, column=1, columnspan=2, sticky="we", **pad)
+        tk.Label(self.root, text="视频来源：").grid(row=0, column=0, sticky="w", **pad)
+        self.url_entry = tk.Entry(self.root, width=44)
+        self.url_entry.grid(row=0, column=1, sticky="we", **pad)
+        self.file_btn = tk.Button(self.root, text="选择文件", width=8,
+                                  command=self._on_choose_file)
+        self.file_btn.grid(row=0, column=2, padx=(4, 12))
 
-        tk.Label(self.root, text="检测阈值：").grid(row=1, column=0, sticky="w", **pad)
+        tk.Label(self.root, text="", fg="gray", font=("", 8)).grid(
+            row=1, column=1, sticky="w", padx=12)
+
+        tk.Label(self.root, text="检测阈值：").grid(row=2, column=0, sticky="w", **pad)
         self.threshold_entry = tk.Entry(self.root, width=10)
         self.threshold_entry.insert(0, str(DEFAULT_THRESHOLD))
-        self.threshold_entry.grid(row=1, column=1, sticky="w", **pad)
+        self.threshold_entry.grid(row=2, column=1, sticky="w", **pad)
         tk.Label(self.root, text="（值越小越灵敏）", fg="gray").grid(
-            row=1, column=2, sticky="w")
+            row=2, column=2, sticky="w")
 
         self.start_btn = tk.Button(self.root, text="开始分析", width=16,
                                    command=self._on_start)
-        self.start_btn.grid(row=2, column=0, columnspan=3, pady=10)
+        self.start_btn.grid(row=3, column=0, columnspan=3, pady=10)
 
-        self.progress = ttk.Progressbar(self.root, length=500, mode="determinate")
-        self.progress.grid(row=3, column=0, columnspan=3, **pad)
+        self.progress = ttk.Progressbar(self.root, length=520, mode="determinate")
+        self.progress.grid(row=4, column=0, columnspan=3, **pad)
 
-        self.status_label = tk.Label(self.root, text="就绪", fg="gray", anchor="w")
-        self.status_label.grid(row=4, column=0, columnspan=3, sticky="we", **pad)
+        self.status_label = tk.Label(self.root, text="就绪  |  支持粘贴链接或选择本地视频文件",
+                                     fg="gray", anchor="w")
+        self.status_label.grid(row=5, column=0, columnspan=3, sticky="we", **pad)
 
         self.output_label = tk.Label(self.root, text="", fg="blue", cursor="hand2",
-                                     anchor="w", wraplength=520)
-        self.output_label.grid(row=5, column=0, columnspan=3, sticky="we", **pad)
+                                     anchor="w", wraplength=540)
+        self.output_label.grid(row=6, column=0, columnspan=3, sticky="we", **pad)
         self.output_label.bind("<Button-1>", self._on_open_folder)
         self._output_path = None
 
         self.root.columnconfigure(1, weight=1)
 
+    def _on_choose_file(self):
+        filetypes = [
+            ("视频文件", "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts"),
+            ("所有文件", "*.*"),
+        ]
+        path = filedialog.askopenfilename(title="选择本地视频文件", filetypes=filetypes)
+        if path:
+            self.url_entry.delete(0, tk.END)
+            self.url_entry.insert(0, path)
+
     def _on_start(self):
         url = self.url_entry.get().strip()
         if not url:
-            messagebox.showwarning("提示", "请输入视频链接")
+            messagebox.showwarning("提示", "请输入视频链接或选择本地文件")
             return
 
         try:
