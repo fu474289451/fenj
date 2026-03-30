@@ -5,6 +5,7 @@ Video Scene Storyboard Tool
 
 import os
 import re
+import sys
 import shutil
 import tempfile
 import threading
@@ -21,7 +22,7 @@ import numpy as np
 import yt_dlp
 import cv2
 from scenedetect import open_video, SceneManager
-from scenedetect.detectors import ContentDetector
+from scenedetect.detectors import ContentDetector, AdaptiveDetector
 from PIL import Image as PILImage
 
 # ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ from PIL import Image as PILImage
 GIF_WIDTH = 320
 GIF_MAX_FRAMES = 24
 GIF_FPS = 8
-DEFAULT_THRESHOLD = 27.0
+DEFAULT_THRESHOLD = 20.0
 SHOT_DIR_NAME = "shots"
 STORYBOARD_FILENAME = "storyboard.html"
 COLS_PER_ROW = 3
@@ -38,17 +39,30 @@ COLS_PER_ROW = 3
 SceneCut = namedtuple("SceneCut", ["index", "start_time", "end_time", "start_frame", "end_frame"])
 
 # Load face cascade once (ships with OpenCV)
-_face_cascade_path = os.path.join(
-    os.path.dirname(cv2.__file__), "data", "haarcascade_frontalface_default.xml"
-)
+# Support both normal run and PyInstaller bundled mode
+def _find_cascade_path():
+    candidates = [
+        os.path.join(os.path.dirname(cv2.__file__), "data", "haarcascade_frontalface_default.xml"),
+    ]
+    # PyInstaller bundle path
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        candidates.insert(0, os.path.join(base, "cv2", "data", "haarcascade_frontalface_default.xml"))
+        candidates.insert(0, os.path.join(base, "haarcascade_frontalface_default.xml"))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return ""
+
 _face_cascade = None
 
 
 def _get_face_cascade():
     global _face_cascade
     if _face_cascade is None:
-        if os.path.exists(_face_cascade_path):
-            _face_cascade = cv2.CascadeClassifier(_face_cascade_path)
+        cascade_path = _find_cascade_path()
+        if cascade_path:
+            _face_cascade = cv2.CascadeClassifier(cascade_path)
         else:
             _face_cascade = cv2.CascadeClassifier()
     return _face_cascade
@@ -385,8 +399,16 @@ def detect_scenes(video_path: str, threshold: float, progress_cb) -> list:
     progress_cb("正在分析镜头...", 0)
 
     video = open_video(video_path)
+    fps = video.frame_rate
+    # min_scene_len: at least 0.4 seconds to avoid false micro-cuts
+    min_len = max(1, int(fps * 0.4))
     scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector(threshold=threshold))
+    # Use both detectors: ContentDetector for hard cuts,
+    # AdaptiveDetector for gradual transitions — union of results
+    scene_manager.add_detector(ContentDetector(threshold=threshold, min_scene_len=min_len))
+    scene_manager.add_detector(AdaptiveDetector(
+        adaptive_threshold=3.0, min_scene_len=min_len
+    ))
 
     total_frames = video.duration.get_frames()
 
