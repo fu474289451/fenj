@@ -40,7 +40,7 @@ for /f "delims=" %%i in ('python -c "import cv2, os; print(os.path.join(os.path.
 
 if exist "%CASCADE_PATH%" (
     echo 找到人脸检测模型: %CASCADE_PATH%
-    pyinstaller --onefile --windowed ^
+    python -m PyInstaller --onefile --windowed ^
         --name "视频镜头分镜工具" ^
         --add-data "%CASCADE_PATH%;." ^
         --hidden-import=numpy ^
@@ -58,7 +58,7 @@ if exist "%CASCADE_PATH%" (
         scene_storyboard.py
 ) else (
     echo 警告: 未找到人脸检测模型，景别检测功能可能受限。
-    pyinstaller --onefile --windowed ^
+    python -m PyInstaller --onefile --windowed ^
         --name "视频镜头分镜工具" ^
         --hidden-import=numpy ^
         --hidden-import=numpy.core ^
